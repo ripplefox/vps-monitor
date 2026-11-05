@@ -188,7 +188,7 @@ const server = http.createServer((req, res) => {
         const now = Date.now();
         const result = Object.keys(vpsData).map(id => {
             const node = vpsData[id];
-            return { id, ...node, online: (now - node.lastSeen) < 15000 };
+            return { id, ...node, online: (now - node.lastSeen) < 120000 };
         });
         
         // 核心排序：强制按 VPS 别名进行固定字母及数字 A-Z 升序排列
