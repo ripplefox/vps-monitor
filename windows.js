@@ -140,11 +140,31 @@ function doReport() {
     };
 
     const req = httpClient.request(options, (res) => {
+        // 监听 data 事件以确保消耗掉响应流
         res.on('data', () => {}); 
+        
+        // 当响应流结束时，代表与服务器的本次交互完美完成
+        res.on('end', () => {
+            if (res.statusCode === 200) {
+                // 👇 新增：获取精确到时分秒的当前时间
+                const now = new Date();
+                const hh = String(now.getHours()).padStart(2, '0');
+                const mm = String(now.getMinutes()).padStart(2, '0');
+                const ss = String(now.getSeconds()).padStart(2, '0');
+                
+                console.log(`[${hh}:${mm}:${ss}] [${VPS_ID}] 指标上报成功！`);
+            } else {
+                console.error(`[${VPS_ID}] 上报失败，服务器返回状态码: ${res.statusCode}`);
+            }
+        });
     });
     
     req.on('error', (err) => {
-        console.error(`[${VPS_ID}] 上报失败: ${err.message}`);
+        const now = new Date();
+        const hh = String(now.getHours()).padStart(2, '0');
+        const mm = String(now.getMinutes()).padStart(2, '0');
+        const ss = String(now.getSeconds()).padStart(2, '0');
+        console.error(`[${hh}:${mm}:${ss}] [${VPS_ID}] 上报错误: ${err.message}`);
     });
     
     req.write(payload);
