@@ -70,7 +70,7 @@ setInterval(() => {
 
     Object.keys(vpsData).forEach(id => {
         const node = vpsData[id];
-        const isOnline = (now - node.lastSeen) < 15000; // 15秒没心跳判定网页端离线
+        const isOnline = (now - node.lastSeen) < 120000; // 120秒没心跳判定网页端离线
 
         if (!isOnline) {
             // 1. 如果是第一次检测到失联，仅记录当前时间，激活防抖观察
