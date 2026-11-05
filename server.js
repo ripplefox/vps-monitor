@@ -42,7 +42,7 @@ function sendNtfyAlert(vpsId, reason) {
             headers: {
                 'Content-Type': 'text/plain; charset=utf-8',
                 // 👇 核心修改：改用 URL 编码传输中文标题，完美解决 Base64 字母显示问题
-                'X-Title': encodeURIComponent(title), 
+                'X-Title': vpsId,//encodeURIComponent(title), 
                 'X-Title-Encoding': 'utf-8',
                 'X-Priority': '5', // 5 = Max 紧急强提醒
                 'X-Tags': 'warning,computer'
