@@ -1,0 +1,9 @@
+{
+  "SERVER_IP": "你的服务端公网IP",
+  "SERVER_PORT": 3000,
+  "SECRET_KEY": "your_super_secret_key",
+  "VPS_ID": "01-HK-CN2",
+  "REPORT_INTERVAL": 5000,
+  "MONITOR_DIR_PATH": "/var/lib/db",
+  "MONITOR_DIR_MAX_SIZE": "18G"
+}
