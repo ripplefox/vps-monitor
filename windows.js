@@ -99,18 +99,17 @@ function getDiskUsage() {
     }
 }
 
-// 获取 Windows 系统运行时间
+// 获取 Windows 系统运行时间（通过 PowerShell 强制在管道输出中应用 UTF-8 编码，不改动服务端）
 function getUptime() {
     try {
-        // 分步获取，避免复杂的内嵌变量解析
-        const cmd = `powershell -NoProfile -Command "$uptime = (Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime; '{0}天 {1}时 {2}分' -f $uptime.Days, $uptime.Hours, $uptime.Minutes"`;
-        const output = execSync(cmd).toString().trim();
+        // [Console]::OutputEncoding 强制将终端运行时输出设置为 UTF-8 字符集
+        const cmd = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $uptime = (Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime; '{0}天 {1}时 {2}分' -f $uptime.Days, $uptime.Hours, $uptime.Minutes"`;
+        const output = execSync(cmd).toString('utf8').trim(); // 显式用 utf8 接收字节流
         return output || '未知';
     } catch (e) {
-        // 如果上面由于组件缺失失败，换用更古老的传统 WMI 兼容写法作为保底
         try {
-            const backupCmd = `powershell -NoProfile -Command "$os = Get-WmiObject Win32_OperatingSystem; $uptime = (Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime); '{0}天 {1}时 {2}分' -f $uptime.Days, $uptime.Hours, $uptime.Minutes"`;
-            return execSync(backupCmd).toString().trim();
+            const backupCmd = `powershell -NoProfile -Command "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $os = Get-WmiObject Win32_OperatingSystem; $uptime = (Get-Date) - $os.ConvertToDateTime($os.LastBootUpTime); '{0}天 {1}时 {2}分' -f $uptime.Days, $uptime.Hours, $uptime.Minutes"`;
+            return execSync(backupCmd).toString('utf8').trim();
         } catch (err) {
             return '未知';
         }
