@@ -45,7 +45,7 @@ function sendNtfyAlert(vpsId, reason) {
             method: 'POST',
             headers: {
                 'Content-Type': 'text/plain; charset=utf-8',
-                'X-Title': `base64:${base64Title}`, // 使用 base64 编码防止中文标题在 header 中乱码
+                'X-Title': title,//`base64:${base64Title}`, // 使用 base64 编码防止中文标题在 header 中乱码
                 //'X-Title-Encoding': 'base64',
                 'X-Priority': '5', // 5 = Max 紧急程度（在手机端会发出强警报并置顶）
                 'X-Tags': 'warning,computer'
