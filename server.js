@@ -228,3 +228,6 @@ const server = http.createServer((req, res) => {
 });
 
 server.listen(PORT, () => { 
+    console.log(`[看板主控端] 服务已完美启动！`);
+    console.log(`监听本地端口: ${PORT} | ntfy 告警引擎: ${ALERT_ENABLED ? '开启' : '关闭'}`);
+});
