@@ -28,14 +28,10 @@ function sendNtfyAlert(vpsId, reason) {
     console.log(`[ntfy 告警触发] 正在为 ${vpsId} 发送通知...`);
 
     const title = `🚨 VPS 离线告警: ${vpsId}`;
-    const base64Title = Buffer.from(title).toString('base64');
     const bodyText = `节点名称: ${vpsId}\n触发原因: ${reason}\n\n※ 24小时内同节点仅通知一次。`;
 
     try {
-        // 拼接完整的请求路径
         const targetUrl = new URL(`${config.NTFY_SERVER}/${config.NTFY_TOPIC}`);
-        
-        // 根据配置自动选择是用 http 还是 https 模块
         const httpModule = targetUrl.protocol === 'https:' ? https : http;
 
         const options = {
@@ -45,15 +41,16 @@ function sendNtfyAlert(vpsId, reason) {
             method: 'POST',
             headers: {
                 'Content-Type': 'text/plain; charset=utf-8',
-                'X-Title': title,//`base64:${base64Title}`, // 使用 base64 编码防止中文标题在 header 中乱码
-                //'X-Title-Encoding': 'base64',
-                'X-Priority': '5', // 5 = Max 紧急程度（在手机端会发出强警报并置顶）
+                // 👇 核心修改：改用 URL 编码传输中文标题，完美解决 Base64 字母显示问题
+                'X-Title': encodeURIComponent(title), 
+                'X-Title-Encoding': 'utf-8',
+                'X-Priority': '5', // 5 = Max 紧急强提醒
                 'X-Tags': 'warning,computer'
             }
         };
 
         const req = httpModule.request(options, (res) => {
-            res.on('data', () => {}); // 消耗响应流
+            res.on('data', () => {}); 
         });
 
         req.on('error', (e) => console.error('ntfy 发送错误:', e.message));
@@ -63,6 +60,7 @@ function sendNtfyAlert(vpsId, reason) {
         console.error('解析 ntfy URL 失败:', e.message);
     }
 }
+
 
 // === 3. 定时轮询：每 10 秒扫描一次所有 VPS 的在线状态 ===
 setInterval(() => {
