@@ -1,4 +1,5 @@
 const http = require('http');
+const https = require('https'); // 👇 新增：引入 https 模块
 const path = require('path');
 const fs = require('fs');
 const execSync = require('child_process').execSync;
@@ -14,23 +15,28 @@ try {
     process.exit(1);
 }
 
-// 映射配置变量（如果缺失则赋予默认值）
-const SERVER_IP = config.SERVER_IP;
+// 映射配置变量（适配反代域名的参数结构）
+const SERVER_HOST = config.SERVER_HOST || 'localhost';
 const SERVER_PORT = config.SERVER_PORT || 3000;
+const SERVER_PATH = config.SERVER_PATH || '/api/report'; // 支持配置 /vps/api/report
+const USE_HTTPS = config.USE_HTTPS || false;            // 开启 HTTPS 协议开关
 const SECRET_KEY = config.SECRET_KEY;
 const VPS_ID = config.VPS_ID || 'Unknown-VPS';
 const REPORT_INTERVAL = config.REPORT_INTERVAL || 5000;
 const MONITOR_DIR_PATH = config.MONITOR_DIR_PATH || '';
 const MONITOR_DIR_MAX_SIZE = config.MONITOR_DIR_MAX_SIZE || '';
 
+// 选择网络请求模块
+const httpClient = USE_HTTPS ? https : http;
+
 // === 2. 辅助核心函数 ===
 
-// 将大小配置字符串转为 KB 方便对比 (例如 "18G" -> 18874368 KB)
+// 将大小配置字符串转为 KB
 function parseSizeToKB(sizeStr) {
     if (!sizeStr) return 0;
     const match = sizeStr.toUpperCase().match(/^(\d+(?:\.\d+)?)\s*([GM])$/);
     if (!match) return 0;
-    const num = parseFloat(match[1]);
+    const num = parseFloat(match);
     const unit = match[2];
     if (unit === 'G') return num * 1024 * 1024;
     if (unit === 'M') return num * 1024;
@@ -41,7 +47,6 @@ function parseSizeToKB(sizeStr) {
 function getCustomDirUsage() {
     if (!MONITOR_DIR_PATH || !MONITOR_DIR_MAX_SIZE) return null;
     try {
-        // 使用 du -sb 获取目录的实际字节大小 (B)，并换算成 KB
         const output = execSync(`du -sb "${MONITOR_DIR_PATH}" 2>/dev/null | awk '{print $1}'`).toString().trim();
         const currentBytes = parseInt(output) || 0;
         const currentKB = currentBytes / 1024;
@@ -53,22 +58,21 @@ function getCustomDirUsage() {
         return {
             path: MONITOR_DIR_PATH,
             max: MONITOR_DIR_MAX_SIZE,
-            pct: percentage > 100 ? 100 : percentage // 封顶 100%
+            pct: percentage > 100 ? 100 : percentage
         };
     } catch (e) {
-        // 如果目录不存在、路径错误或没有 du 读取权限，将错误反馈给服务端
         return { path: MONITOR_DIR_PATH, max: MONITOR_DIR_MAX_SIZE, error: true };
     }
 }
 
-// 采用采样差值法计算真实的 Linux CPU 使用率
+// 计算真实的 Linux CPU 使用率
 let lastCpuTick = { idle: 0, total: 0 };
 function getCpuUsage() {
     try {
         const lines = fs.readFileSync('/proc/stat', 'utf8').split('\n');
         const parts = lines[0].split(/\s+/).slice(1).map(Number);
-        const idle = parts[3]; // idle 对应的 tick
-        const total = parts.reduce((a, b) => a + b, 0); // 总 tick
+        const idle = parts[3]; 
+        const total = parts.reduce((a, b) => a + b, 0);
 
         const deltaIdle = idle - lastCpuTick.idle;
         const deltaTotal = total - lastCpuTick.total;
@@ -82,7 +86,7 @@ function getCpuUsage() {
     }
 }
 
-// 读取 /proc/meminfo 计算纯原生内存使用率
+// 计算内存使用率
 function getMemUsage() {
     try {
         const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
@@ -94,7 +98,7 @@ function getMemUsage() {
     }
 }
 
-// 获取全局系统磁盘整体使用率
+// 获取系统磁盘整体使用率
 function getDiskUsage() {
     try {
         const output = execSync("df / | tail -1 | awk '{print $5}'").toString().trim();
@@ -104,7 +108,7 @@ function getDiskUsage() {
     }
 }
 
-// 获取系统在线运行时间 (格式化为 X天 X时 X分)
+// 获取系统在线运行时间
 function getUptime() {
     try {
         const uptimeSec = parseFloat(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
@@ -126,13 +130,14 @@ function doReport() {
         mem: getMemUsage(),
         disk: getDiskUsage(),
         uptime: getUptime(),
-        customDir: getCustomDirUsage() // 将特定目录监控数据动态拼入载荷
+        customDir: getCustomDirUsage()
     });
 
+    // 动态适配反代环境的 options
     const options = {
-        hostname: SERVER_IP,
+        hostname: SERVER_HOST,
         port: SERVER_PORT,
-        path: '/api/report',
+        path: SERVER_PATH, // 此时将请求发送至 /vps/api/report
         method: 'POST',
         headers: {
             'Content-Type': 'application/json',
@@ -140,21 +145,22 @@ function doReport() {
         }
     };
 
-    const req = http.request(options, (res) => {
-        res.on('data', () => {}); // 及时消耗掉响应流，防止内存泄漏
+    // 使用动态选择的 httpClient (http 或 https) 发送
+    const req = httpClient.request(options, (res) => {
+        res.on('data', () => {}); 
     });
     
     req.on('error', (err) => {
-        console.error(`[${VPS_ID}] 上报失败，无法连接到主控端: ${err.message}`);
+        console.error(`[${VPS_ID}] 上报失败，无法连接到 ${SERVER_HOST}: ${err.message}`);
     });
     
     req.write(payload);
     req.end();
 }
 
-// 先执行一次初始化 CPU 采样基准线
+// 初始化 CPU 采样基准线
 getCpuUsage(); 
 
-// 根据设定的毫秒数启动循环轮询任务
-console.log(`[${VPS_ID}] 成功加载配置文件。Agent 已启动，正在向 http://${SERVER_IP}:${SERVER_PORT} 上报指标...`);
+// 启动循环轮询任务
+console.log(`[${VPS_ID}] 成功加载反代配置。Agent已启动，正在上报至 ${USE_HTTPS ? 'https' : 'http'}://${SERVER_HOST}:${SERVER_PORT}${SERVER_PATH} ...`);
 setInterval(doReport, REPORT_INTERVAL);
