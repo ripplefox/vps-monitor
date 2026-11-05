@@ -28,6 +28,7 @@ function sendNtfyAlert(vpsId, reason) {
     console.log(`[ntfy 告警触发] 正在为 ${vpsId} 发送通知...`);
 
     const title = `🚨 VPS 离线告警: ${vpsId}`;
+    const base64Title = Buffer.from(title).toString('base64');
     const bodyText = `节点名称: ${vpsId}\n触发原因: ${reason}\n\n※ 24小时内同节点仅通知一次。`;
 
     try {
@@ -44,8 +45,8 @@ function sendNtfyAlert(vpsId, reason) {
             method: 'POST',
             headers: {
                 'Content-Type': 'text/plain; charset=utf-8',
-                'X-Title': Buffer.from(title).toString('base64'), // 使用 base64 编码防止中文标题在 header 中乱码
-                'X-Title-Encoding': 'base64',
+                'X-Title': `base64:${base64Title}`, // 使用 base64 编码防止中文标题在 header 中乱码
+                //'X-Title-Encoding': 'base64',
                 'X-Priority': '5', // 5 = Max 紧急程度（在手机端会发出强警报并置顶）
                 'X-Tags': 'warning,computer'
             }
