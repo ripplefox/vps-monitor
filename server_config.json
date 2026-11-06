@@ -2,6 +2,7 @@
   "PORT": 3002,
   "SECRET_KEY": "your_super_secret_key",
   "ALERT_ENABLED": true,
-  "NTFY_SERVER": "https://ntfy.sh",
-  "NTFY_TOPIC": "vps_alerts"
+  "NTFY_SERVER": "https://ntfy.google.com",
+  "NTFY_TOPIC": "vps_alerts",
+  "NTFY_TOKEN": ""
 }

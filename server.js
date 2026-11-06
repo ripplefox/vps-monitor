@@ -22,14 +22,25 @@ let vpsData = {};
 let alertHistory = {};        // 格式: { "HK-01": 1711234567890 } -> 记录上一次真实告警的时间戳
 let disconnectStartTime = {}; // 格式: { "HK-01": 1711234567890 } -> 记录首次断线的起始时间
 
-// === 2. ntfy 专用告警发送函数 (纯原生网络请求) ===
-function sendNtfyAlert(vpsId, reason) {
-    if (!ALERT_ENABLED || !config.NTFY_SERVER || !config.NTFY_TOPIC) return;
+// === 2.1 ntfy 鉴权头构造 (优先 access token, 回退用户名密码) ===
+function buildNtfyAuthHeader() {
+    // 推荐用 access token: 不需要在多处保存密码, 且可随时吊销
+    if (config.NTFY_TOKEN) {
+        return { 'Authorization': `Bearer ${config.NTFY_TOKEN}` };
+    }
+    // 回退方案: Basic 认证 (用户名 + 密码)
+    if (config.NTFY_USER && config.NTFY_PASSWORD) {
+        const basic = Buffer.from(`${config.NTFY_USER}:${config.NTFY_PASSWORD}`).toString('base64');
+        return { 'Authorization': `Basic ${basic}` };
+    }
+    console.warn('[ntfy 告警] 未配置 NTFY_TOKEN 或 NTFY_USER/NTFY_PASSWORD, 将以匿名身份发送 (服务器大概率拒绝)');
+    return {};
+}
 
-    console.log(`[ntfy 告警触发] 正在为 [${vpsId}] 发送通知...`);
-
-    const title = `🚨 VPS 离线告警: ${vpsId}`;
-    const bodyText = `节点名称: ${vpsId}\n触发原因: ${reason}\n\n※ 24小时内同节点仅通知一次。`;
+// === 2. ntfy 消息发送函数 (纯原生网络请求) ===
+// title: 消息标题 (X-Title); bodyText: 消息正文; logTag: 控制台日志前缀
+function sendNtfyMessage(title, bodyText, logTag) {
+    if (!config.NTFY_SERVER || !config.NTFY_TOPIC) return;
 
     try {
         const targetUrl = new URL(`${config.NTFY_SERVER}/${config.NTFY_TOPIC}`);
@@ -43,15 +54,26 @@ function sendNtfyAlert(vpsId, reason) {
             headers: {
                 'Content-Type': 'text/plain; charset=utf-8',
                 // 使用 URL 百分比编码传输中文标题，配合 utf-8 声明，在手机 ntfy 客户端中完美显示中文
-                'X-Title': vpsId,//encodeURIComponent(title), 
-                'X-Title-Encoding': 'utf-8',
+                // Node 的请求头只接受 latin1, 这里把 UTF-8 文本转成原始字节直发;
+                // ntfy 默认按 UTF-8 解析标题, 不要用 encodeURIComponent (那样 ntfy 不会解码)
+                'X-Title': Buffer.from(title, 'utf8').toString('latin1'),
                 'X-Priority': '5', // 5 = Max 紧急程度，手机端会弹出强警报并置顶
-                'X-Tags': 'warning,computer'
+                'X-Tags': 'warning,computer',
+                // 鉴权: access token 优先, 其次用户名密码
+                ...buildNtfyAuthHeader()
             }
         };
 
         const req = httpModule.request(options, (res) => {
-            res.on('data', () => {}); // 及时消耗掉响应流
+            let respBody = '';
+            res.on('data', (chunk) => { respBody += chunk; });
+            res.on('end', () => {
+                if (res.statusCode >= 200 && res.statusCode < 300) {
+                    console.log(`[${logTag}] 发送成功: ${title} (HTTP ${res.statusCode})`);
+                } else {
+                    console.error(`[${logTag}] 发送失败: ${title} HTTP ${res.statusCode} ${respBody.slice(0, 200)}`);
+                }
+            });
         });
 
         req.on('error', (e) => console.error('ntfy 发送错误:', e.message));
@@ -60,6 +82,25 @@ function sendNtfyAlert(vpsId, reason) {
     } catch (e) {
         console.error('解析 ntfy URL 失败:', e.message);
     }
+}
+
+// === 2.2 VPS 离线告警 ===
+function sendNtfyAlert(vpsId, reason) {
+    if (!ALERT_ENABLED) return;
+
+    console.log(`[ntfy 告警触发] 正在为 [${vpsId}] 发送通知...`);
+
+    sendNtfyMessage(
+        vpsId,
+        `节点名称: ${vpsId}\n触发原因: ${reason}\n\n※ 24小时内同节点仅通知一次。`,
+        'ntfy 告警'
+    );
+}
+
+// === 2.3 服务启动通知 (可用 NTFY_STARTUP_NOTICE=false 关闭) ===
+function sendStartupNotice() {
+    if (config.NTFY_STARTUP_NOTICE === false) return;
+    sendNtfyMessage('监控启动', '[看板主控端] 服务已完美启动！', 'ntfy 启动通知');
 }
 
 // === 3. 定时轮询：每 10 秒扫描一次所有 VPS 的在线状态 ===
@@ -230,4 +271,6 @@ const server = http.createServer((req, res) => {
 server.listen(PORT, () => { 
     console.log(`[看板主控端] 服务已完美启动！`);
     console.log(`监听本地端口: ${PORT} | ntfy 告警引擎: ${ALERT_ENABLED ? '开启' : '关闭'}`);
+    // 启动即发一条通知, 确认服务已就绪
+    sendStartupNotice();
 });
