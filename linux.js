@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https'); // 👇 新增：引入 https 模块
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const execSync = require('child_process').execSync;
 
 // === 1. 动态读取本地 JSON 配置文件 ===
@@ -25,6 +26,9 @@ const VPS_ID = config.VPS_ID || 'Unknown-VPS';
 const REPORT_INTERVAL = config.REPORT_INTERVAL || 5000;
 const MONITOR_DIR_PATH = config.MONITOR_DIR_PATH || '';
 const MONITOR_DIR_MAX_SIZE = config.MONITOR_DIR_MAX_SIZE || '';
+
+// CPU 核心数取自 Node 内置信息，无需额外采集命令，开销可忽略
+const CPU_CORES = os.cpus().length || null;
 
 // 选择网络请求模块
 const httpClient = USE_HTTPS ? https : http;
@@ -86,25 +90,51 @@ function getCpuUsage() {
     }
 }
 
-// 计算内存使用率
-function getMemUsage() {
+// 计算内存使用率，并顺带返回总容量（/proc/meminfo 已经读了，几乎零额外开销）
+function getMemInfo() {
     try {
         const meminfo = fs.readFileSync('/proc/meminfo', 'utf8');
-        const total = parseInt(meminfo.match(/MemTotal:\s+(\d+)/)[1]);
-        const available = parseInt(meminfo.match(/MemAvailable:\s+(\d+)/)[1]);
-        return Math.round(((total - available) / total) * 100);
+        const readKB = (key) => {
+            const match = meminfo.match(new RegExp(key + ':\\s+(\\d+)'));
+            return match ? parseInt(match[1], 10) : NaN;
+        };
+
+        const totalKB = readKB('MemTotal');
+        // 老内核可能没有 MemAvailable，退回到 Free + Buffers + Cached
+        let availableKB = readKB('MemAvailable');
+        if (!isFinite(availableKB)) {
+            availableKB = (readKB('MemFree') || 0) + (readKB('Buffers') || 0) + (readKB('Cached') || 0);
+        }
+
+        if (!isFinite(totalKB) || totalKB <= 0 || !isFinite(availableKB)) return null;
+
+        const pct = Math.round(((totalKB - availableKB) / totalKB) * 100);
+        return {
+            pct: Math.max(0, Math.min(100, pct)),
+            totalBytes: totalKB * 1024
+        };
     } catch (e) { 
-        return 0; 
+        return null; 
     }
 }
 
-// 获取系统磁盘整体使用率
-function getDiskUsage() {
+// 获取系统磁盘整体使用率，并从同一条 df 输出中解析总容量
+function getDiskInfo() {
     try {
-        const output = execSync("df / | tail -1 | awk '{print $5}'").toString().trim();
-        return parseInt(output.replace('%', '')) || 0;
+        // -k 以 KB 为单位；tail -1 取根分区那一行，避免多挂载点干扰
+        const output = execSync("df -k / | tail -1", { timeout: 5000 }).toString().trim();
+        const parts = output.split(/\s+/);
+        const totalKB = parseInt(parts[1], 10);
+        const usedKB = parseInt(parts[2], 10);
+        if (!isFinite(totalKB) || totalKB <= 0 || !isFinite(usedKB)) return null;
+
+        const pct = Math.round((usedKB / totalKB) * 100);
+        return {
+            pct: Math.max(0, Math.min(100, pct)),
+            totalBytes: totalKB * 1024
+        };
     } catch (e) { 
-        return 0; 
+        return null; 
     }
 }
 
@@ -123,12 +153,18 @@ function getUptime() {
 
 // === 3. 数据定时上报核心逻辑 ===
 function doReport() {
+    const memInfo = getMemInfo();
+    const diskInfo = getDiskInfo();
+
     const payload = JSON.stringify({
         secret: SECRET_KEY,
         id: VPS_ID,
         cpu: getCpuUsage(),
-        mem: getMemUsage(),
-        disk: getDiskUsage(),
+        cpuCores: CPU_CORES,
+        mem: memInfo ? memInfo.pct : 0,
+        memTotal: memInfo ? memInfo.totalBytes : null,
+        disk: diskInfo ? diskInfo.pct : 0,
+        diskTotal: diskInfo ? diskInfo.totalBytes : null,
         uptime: getUptime(),
         customDir: getCustomDirUsage()
     });

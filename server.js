@@ -17,10 +17,28 @@ const PORT = config.PORT || 3000;
 const SECRET_KEY = config.SECRET_KEY;
 const ALERT_ENABLED = config.ALERT_ENABLED || false;
 
+// 校验 Agent 上报的容量/核心数：只接受有效的正数，缺失或非法时返回 null（前端据此不展示）
+function toPositiveNumber(value) {
+    const num = Number(value);
+    return Number.isFinite(num) && num > 0 ? num : null;
+}
+
+function toPositiveInteger(value) {
+    const num = Number(value);
+    return Number.isInteger(num) && num > 0 ? num : null;
+}
+
 // 存储服务器数据与告警历史变量
 let vpsData = {};
-let alertHistory = {};        // 格式: { "HK-01": 1711234567890 } -> 记录上一次真实告警的时间戳
+let alertHistory = {};        // 格式: { "HK-01": 1711234567890 } -> 记录上一次真实告警的时间戳 (所有告警共用)
 let disconnectStartTime = {}; // 格式: { "HK-01": 1711234567890 } -> 记录首次断线的起始时间
+let usageStreak = {};         // 格式: { "HK-01": { cpu: 1, mem: 2, disk: 0, dir: 0 } } -> 连续达到阈值的次数
+let lastUsageSample = {};     // 格式: { "HK-01": 1711234567890 } -> 已评估过的上报时间, 防止同一份数据被重复计数
+
+const OFFLINE_DEBOUNCE_MS = 5 * 60 * 1000;   // 离线 5 分钟缓冲防抖
+const ALERT_COOLDOWN_MS = 24 * 60 * 60 * 1000; // 同一节点任意告警的 24 小时冷却
+const USAGE_ALERT_THRESHOLD = 90;             // CPU/内存/磁盘/目录 使用率告警阈值 (%)
+const USAGE_ALERT_CONSECUTIVE = 2;            // 连续达到阈值多少次后告警
 
 // === 2.1 ntfy 鉴权头构造 (优先 access token, 回退用户名密码) ===
 function buildNtfyAuthHeader() {
@@ -103,17 +121,64 @@ function sendStartupNotice() {
     sendNtfyMessage('监控启动', '[看板主控端] 服务已完美启动！', 'ntfy 启动通知');
 }
 
-// === 3. 定时轮询：每 10 秒扫描一次所有 VPS 的在线状态 ===
+// === 3.1 使用率告警检查 (CPU / 内存 / 系统磁盘 / 目录) ===
+
+// 收集本轮需要检查的指标；目录未配置、采集失败或没有 pct 时自动跳过
+function collectUsageChecks(node) {
+    const checks = [
+        { key: 'cpu', label: 'CPU', value: node.cpu },
+        { key: 'mem', label: '内存', value: node.mem },
+        { key: 'disk', label: '系统磁盘', value: node.disk }
+    ];
+    if (node.customDir && !node.customDir.error && node.customDir.pct !== undefined && node.customDir.pct !== null) {
+        checks.push({ key: 'dir', label: `目录 ${node.customDir.path || '自定义目录'}`, value: node.customDir.pct });
+    }
+    return checks;
+}
+
+// 同一指标连续 USAGE_ALERT_CONSECUTIVE 次达到阈值则告警, 所有告警共用 24 小时冷却
+function checkUsageAlert(id, node, now) {
+    // 同一份上报数据只评估一次，避免 10 秒轮询把一份高使用率数据重复计为“连续两次”
+    if (lastUsageSample[id] === node.lastSeen) return;
+    lastUsageSample[id] = node.lastSeen;
+
+    if (!usageStreak[id]) usageStreak[id] = {};
+    const streak = usageStreak[id];
+    const triggered = [];
+
+    collectUsageChecks(node).forEach(item => {
+        const value = Number(item.value);
+        const isHigh = Number.isFinite(value) && value >= USAGE_ALERT_THRESHOLD;
+
+        streak[item.key] = isHigh ? Math.min((streak[item.key] || 0) + 1, USAGE_ALERT_CONSECUTIVE) : 0;
+
+        if (streak[item.key] >= USAGE_ALERT_CONSECUTIVE) {
+            triggered.push(`${item.label} 连续 ${USAGE_ALERT_CONSECUTIVE} 次达到 ${Math.round(value)}%（阈值 ${USAGE_ALERT_THRESHOLD}%）`);
+        }
+    });
+
+    if (triggered.length === 0) return;
+
+    // 与离线告警共用 alertHistory: 同一节点 24 小时内无论何种告警只通知一次
+    if (now - (alertHistory[id] || 0) < ALERT_COOLDOWN_MS) return;
+
+    alertHistory[id] = now;
+    sendNtfyAlert(id, triggered.join('\n'));
+}
+
+// === 3.2 定时轮询：每 10 秒扫描一次所有 VPS 的在线状态与使用率 ===
 setInterval(() => {
     const now = Date.now();
-    const FIVE_MINUTES = 5 * 60 * 1000;           // 5 分钟缓冲防抖 (300,000 毫秒)
-    const TWENTY_FOUR_HOURS = 24 * 60 * 60 * 1000; // 24 小时防轰炸
 
     Object.keys(vpsData).forEach(id => {
         const node = vpsData[id];
         const isOnline = (now - node.lastSeen) < 120000; // 120秒没心跳判定网页端离线
 
         if (!isOnline) {
+            // 离线数据可能已过期，清空连续计数；恢复在线后需重新连续两次达标
+            if (usageStreak[id]) usageStreak[id] = {};
+            delete lastUsageSample[id];
+
             // 1. 如果是第一次检测到失联，仅记录当前时间，激活防抖观察
             if (!disconnectStartTime[id]) {
                 disconnectStartTime[id] = now;
@@ -125,15 +190,14 @@ setInterval(() => {
             const disconnectedDuration = now - disconnectStartTime[id];
 
             // 如果连续断线还没有满 5 分钟，控制台打印日志并继续观察，拦截警报打扰
-            if (disconnectedDuration < FIVE_MINUTES) {
-                const remainingSec = Math.round((FIVE_MINUTES - disconnectedDuration) / 1000);
+            if (disconnectedDuration < OFFLINE_DEBOUNCE_MS) {
+                const remainingSec = Math.round((OFFLINE_DEBOUNCE_MS - disconnectedDuration) / 1000);
                 console.log(`[防抖观察] [${id}] 已断线 ${Math.round(disconnectedDuration/1000)} 秒，若持续满 5 分钟将在 ${remainingSec} 秒后报警`);
                 return;
             }
 
             // 3. 已经连续断线超过 5 分钟了，检查 24 小时防轰炸冷却限制
-            const lastAlertTime = alertHistory[id] || 0;
-            if (now - lastAlertTime < TWENTY_FOUR_HOURS) {
+            if (now - (alertHistory[id] || 0) < ALERT_COOLDOWN_MS) {
                 return; 
             }
 
@@ -147,6 +211,9 @@ setInterval(() => {
                 console.log(`[防抖解除] 🎉 [${id}] 在 5 分钟内恢复了心跳，成功拦截网络抖动误报。`);
                 delete disconnectStartTime[id];
             }
+
+            // 6. 在线时检查 CPU/内存/磁盘/目录 是否连续两次达到阈值
+            checkUsageAlert(id, node, now);
         }
     });
 }, 10000);
@@ -181,6 +248,22 @@ const htmlPage = `
                 const res = await fetch('api/status'); // 使用相对路径，完美自适应反向代理路径环境
                 const data = await res.json();
                 document.getElementById('board').innerHTML = data.length === 0 ? '<p style="text-align:center;width:100%">暂无机器上报数据</p>' : data.map(vps => {
+                    // 字节 -> 紧凑容量文本（8G / 7.8G / 512M）；无有效数据时返回空串
+                    const sizeText = (bytes) => {
+                        if (typeof bytes !== 'number' || !isFinite(bytes) || bytes <= 0) return '';
+                        const gb = bytes / 1073741824;
+                        if (gb >= 1) {
+                            const value = gb >= 100 ? Math.round(gb) : Math.round(gb * 10) / 10;
+                            return value + 'G';
+                        }
+                        return Math.max(1, Math.round(bytes / 1048576)) + 'M';
+                    };
+                    const cpuLabel = vps.cpuCores > 0 ? 'CPU（' + vps.cpuCores + '核）' : 'CPU: ';
+                    const memSize = sizeText(vps.memTotal);
+                    const diskSize = sizeText(vps.diskTotal);
+                    const memLabel = memSize ? '内存（' + memSize + '）' : '内存: ';
+                    const diskLabel = diskSize ? '系统磁盘（' + diskSize + '）' : '系统磁盘: ';
+
                     let customDirHtml = '';
                     if (vps.customDir) {
                         customDirHtml = vps.customDir.error 
@@ -190,9 +273,9 @@ const htmlPage = `
                     return \`<div class="card">
                         <span class="badge \${vps.online ? 'online' : 'offline'}">\${vps.online ? '在线' : '离线'}</span>
                         <div class="vps-id">\${vps.id}</div>
-                        <div class="stat-item">CPU: \${vps.cpu}%<div class="progress-bar"><div class="progress \${vps.cpu>80?'high':''}" style="width:\${vps.cpu}%"></div></div></div>
-                        <div class="stat-item">内存: \${vps.mem}%<div class="progress-bar"><div class="progress \${vps.mem>80?'high':''}" style="width:\${vps.mem}%"></div></div></div>
-                        <div class="stat-item">系统磁盘: \${vps.disk}%<div class="progress-bar"><div class="progress \${vps.disk>90?'high':''}" style="width:\${vps.disk}%"></div></div></div>
+                        <div class="stat-item">\${cpuLabel}\${vps.cpu}%<div class="progress-bar"><div class="progress \${vps.cpu>80?'high':''}" style="width:\${vps.cpu}%"></div></div></div>
+                        <div class="stat-item">\${memLabel}\${vps.mem}%<div class="progress-bar"><div class="progress \${vps.mem>80?'high':''}" style="width:\${vps.mem}%"></div></div></div>
+                        <div class="stat-item">\${diskLabel}\${vps.disk}%<div class="progress-bar"><div class="progress \${vps.disk>90?'high':''}" style="width:\${vps.disk}%"></div></div></div>
                         \${customDirHtml}
                         <div style="margin-top:15px;font-size:12px;color:#a0aec0;">
                             运行: \${(() => {
@@ -253,6 +336,10 @@ const server = http.createServer((req, res) => {
                 // 更新内存中的 VPS 数据快照
                 vpsData[data.id] = { 
                     cpu: data.cpu, mem: data.mem, disk: data.disk, 
+                    // 具体容量数据：老版本 Agent 或采集失败时为空，看板仅显示百分比
+                    memTotal: toPositiveNumber(data.memTotal),
+                    diskTotal: toPositiveNumber(data.diskTotal),
+                    cpuCores: toPositiveInteger(data.cpuCores),
                     uptime: data.uptime, customDir: data.customDir, 
                     lastSeen: Date.now() 
                 };

@@ -2,6 +2,7 @@ const http = require('http');
 const https = require('https');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const execSync = require('child_process').execSync;
 
 // === 1. 读取本地 JSON 配置文件 ===
@@ -24,6 +25,9 @@ const VPS_ID = config.VPS_ID || 'Win-VPS';
 const REPORT_INTERVAL = config.REPORT_INTERVAL || 5000;
 const MONITOR_DIR_PATH = config.MONITOR_DIR_PATH || '';
 const MONITOR_DIR_MAX_SIZE = config.MONITOR_DIR_MAX_SIZE || '';
+
+// CPU 逻辑核心数取自 Node 内置信息，无需额外 PowerShell 进程
+const CPU_CORES = os.cpus().length || null;
 
 const httpClient = USE_HTTPS ? https : http;
 
@@ -76,26 +80,42 @@ function getCpuUsage() {
     }
 }
 
-// 获取 Windows 内存使用率
-function getMemUsage() {
+// 获取 Windows 内存使用率与总容量（同一次 PowerShell 调用，不增加采集开销）
+function getMemInfo() {
     try {
-        // 获取总物理内存与当前可用物理内存 (KB)
-        const cmd = `powershell -NoProfile -Command "$os = Get-WmiObject Win32_OperatingSystem; [math]::Round((($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / $os.TotalVisibleMemorySize) * 100)"`;
-        const output = execSync(cmd).toString().trim();
-        return parseInt(output) || 0;
+        // TotalVisibleMemorySize / FreePhysicalMemory 单位均为 KB
+        const cmd = `powershell -NoProfile -Command "$os = Get-WmiObject Win32_OperatingSystem; $total = [double]$os.TotalVisibleMemorySize; $free = [double]$os.FreePhysicalMemory; if ($total -gt 0) { '{0}|{1}' -f [math]::Round((($total - $free) / $total) * 100), [long]($total * 1KB) }"`;
+        const output = execSync(cmd, { timeout: 10000 }).toString().trim();
+        const [pctText, totalText] = output.split('|');
+        const pct = parseFloat(pctText);
+        const totalBytes = parseFloat(totalText);
+        if (!isFinite(pct) || !isFinite(totalBytes) || totalBytes <= 0) return null;
+
+        return {
+            pct: Math.max(0, Math.min(100, Math.round(pct))),
+            totalBytes
+        };
     } catch (e) {
-        return 0;
+        return null;
     }
 }
 
-// 获取 Windows C 盘整体磁盘使用率
-function getDiskUsage() {
+// 获取 Windows C 盘整体使用率与总容量（同一次 PowerShell 调用，不增加采集开销）
+function getDiskInfo() {
     try {
-        const cmd = `powershell -NoProfile -Command "$disk = Get-WmiObject Win32_LogicalDisk -Filter \\"DeviceID='C:'\\"; [math]::Round((($disk.Size - $disk.FreeSpace) / $disk.Size) * 100)"`;
-        const output = execSync(cmd).toString().trim();
-        return parseInt(output) || 0;
+        const cmd = `powershell -NoProfile -Command "$disk = Get-WmiObject Win32_LogicalDisk -Filter \\"DeviceID='C:'\\"; $total = [double]$disk.Size; if ($total -gt 0) { '{0}|{1}' -f [math]::Round((($total - $disk.FreeSpace) / $total) * 100), [long]$total }"`;
+        const output = execSync(cmd, { timeout: 10000 }).toString().trim();
+        const [pctText, totalText] = output.split('|');
+        const pct = parseFloat(pctText);
+        const totalBytes = parseFloat(totalText);
+        if (!isFinite(pct) || !isFinite(totalBytes) || totalBytes <= 0) return null;
+
+        return {
+            pct: Math.max(0, Math.min(100, Math.round(pct))),
+            totalBytes
+        };
     } catch (e) {
-        return 0;
+        return null;
     }
 }
 
@@ -118,12 +138,18 @@ function getUptime() {
 
 // === 3. 数据定时上报逻辑 ===
 function doReport() {
+    const memInfo = getMemInfo();
+    const diskInfo = getDiskInfo();
+
     const payload = JSON.stringify({
         secret: SECRET_KEY,
         id: VPS_ID,
         cpu: getCpuUsage(),
-        mem: getMemUsage(),
-        disk: getDiskUsage(),
+        cpuCores: CPU_CORES,
+        mem: memInfo ? memInfo.pct : 0,
+        memTotal: memInfo ? memInfo.totalBytes : null,
+        disk: diskInfo ? diskInfo.pct : 0,
+        diskTotal: diskInfo ? diskInfo.totalBytes : null,
         uptime: getUptime(),
         customDir: getCustomDirUsage()
     });
